@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Prosto Bots</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    {% include '_navbar.html' %}
+    <div class="container mt-5">
+        <h1 class="display-4 text-center mb-4">Добро пожаловать в Prosto Bots</h1>
+        <p class="lead text-center mb-5">
+            Создавайте и управляйте чат-ботами для автоматизации общения на платформах, таких как Avito.
+        </p>
+        
+        <div class="row">
+            <div class="col-md-8 offset-md-2"> 
+                <p>
+                    Наш сервис позволяет создавать и управлять чат-ботами для автоматизации общения на платформах, таких как Avito. Настройте бота с помощью системного промпта, тестируйте его, подключайте к платформам и экономьте время на обработке сообщений.
+                </p>
+                <h2 class="mt-4">Как создать и активировать бота</h2>
+                <ol>
+                    <li><strong>Зарегистрируйтесь</strong>: Перейдите к Telegram-боту <a href="https://t.me/{{ config.TELEGRAM_BOT_NAME }}" target="_blank">@{{ config.TELEGRAM_BOT_NAME }}</a> и следуйте инструкциям для создания аккаунта.</li>
+                    <li><strong>Войдите</strong>: Авторизуйтесь в системе через страницу логина.</li>
+                    <li><strong>Создайте бота</strong>: На странице "Мои боты" введите системный промпт (например, "Отвечай кратко и профессионально") и нажмите "Создать бота".</li>
+                    <li><strong>Протестируйте</strong>: Перейдите в раздел "Тестировать", отправьте тестовые сообщения и убедитесь, что бот отвечает корректно.</li>
+                    <li><strong>Подключите платформу</strong>: Нажмите "Подключить" и авторизуйтесь на Avito для интеграции бота.</li>
+                    <li><strong>Активируйте</strong>: На странице "Мои боты" нажмите "Активировать", чтобы запустить бота.</li>
+                </ol>
+
+            </div>
+        </div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>

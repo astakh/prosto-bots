@@ -1,0 +1,963 @@
+==================================================
+Directory: .\app
+==================================================
+
+File: .\app\auth.py
+----------------------------------------
+import datetime as dt
+from typing import Dict, Optional
+from fastapi import Depends, HTTPException, Request, Response, status
+from fastapi.security.utils import get_authorization_scheme_param
+import jwt
+from jwt import PyJWTError as JWTError
+from passlib.handlers.bcrypt import bcrypt
+from rich.console import Console
+from .config import SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES, COOKIE_NAME, SERVICE_CONFIG
+from .database import get_db_connection
+
+console = Console()
+
+async def check_user_exists(telegram_id: str, conn=Depends(get_db_connection)) -> bool:
+    return await conn.fetchval("SELECT EXISTS(SELECT 1 FROM users WHERE telegram_id = $1)", telegram_id)
+
+async def check_username_exists(username: str, conn=Depends(get_db_connection)) -> bool:
+    return await conn.fetchval("SELECT EXISTS(SELECT 1 FROM users WHERE username = $1)", username)
+
+async def register_user(telegram_id: str, username: str, password: str, conn=Depends(get_db_connection)):
+    if await check_username_exists(username, conn):
+        raise HTTPException(status_code=400, detail="Username already taken")
+    if await check_user_exists(telegram_id, conn):
+        raise HTTPException(status_code=400, detail="Telegram ID already registered")
+    
+    hashed_password = bcrypt.hash(password)
+    trial_end = dt.datetime.utcnow() + dt.timedelta(days=SERVICE_CONFIG["free_period_days"])
+    await conn.execute(
+        """
+        INSERT INTO users (telegram_id, username, password_hash, registration_date, trial_end_date, balance)
+        VALUES ($1, $2, $3, NOW(), $4, 0.00)
+        """,
+        telegram_id, username, hashed_password, trial_end
+    )
+
+async def get_user(username: str, conn=Depends(get_db_connection)) -> Optional[dict]:
+    row = await conn.fetchrow("SELECT * FROM users WHERE username = $1", username)
+    return dict(row) if row else None
+
+async def authenticate_user(username: str, plain_password: str, conn=Depends(get_db_connection)) -> Optional[dict]:
+    user = await get_user(username, conn)
+    if not user or not bcrypt.verify(plain_password, user["password_hash"]):
+        return False
+    return user
+
+async def oauth2_scheme(request: Request) -> Optional[str]:
+    authorization: str = request.cookies.get(COOKIE_NAME)
+    scheme, param = get_authorization_scheme_param(authorization)
+    if not authorization or scheme.lower() != "bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return param
+
+def create_access_token(data: Dict) -> str:
+    to_encode = data.copy()
+    expire = dt.datetime.utcnow() + dt.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def decode_token(token: str) -> dict:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials."
+    )
+    token = token.removeprefix("Bearer").strip()
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("username")
+        if username is None:
+            raise credentials_exception
+    except JWTError as e:
+        console.log(f"[red]JWT Error: {e}")
+        raise credentials_exception
+    return {"username": username}
+
+async def get_current_user_from_token(token: str = Depends(oauth2_scheme), conn=Depends(get_db_connection)) -> dict:
+    user_data = decode_token(token)
+    db_user = await get_user(user_data["username"], conn)
+    if not db_user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return db_user
+
+async def get_current_user_from_cookie(request: Request, conn=Depends(get_db_connection)) -> Optional[dict]:
+    token = request.cookies.get(COOKIE_NAME)
+    if not token:
+        return None
+    user_data = decode_token(token)
+    return await get_user(user_data["username"], conn)
+
+async def login_for_access_token(response: Response, username: str, password: str, conn=Depends(get_db_connection)) -> Dict[str, str]:
+    user = await authenticate_user(username, password, conn)
+    if not user:
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    access_token = create_access_token(data={"username": user["username"]})
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=f"Bearer {access_token}",
+        httponly=True
+    )
+    return {COOKIE_NAME: access_token, "token_type": "bearer"}
+
+File: .\app\bot.py
+----------------------------------------
+import asyncio
+import asyncpg
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from config import TELEGRAM_TOKEN, SERVICE_CONFIG, DB_CONFIG, API_BASE_URL
+from auth import register_user
+from rich.console import Console
+
+console = Console()
+
+bot = Bot(token=TELEGRAM_TOKEN)
+dp = Dispatcher()
+
+user_data = {}
+
+async def create_db_pool():
+    return await asyncpg.create_pool(**DB_CONFIG)
+
+@dp.message(Command("start"))
+async def start_command(message: types.Message):
+    telegram_id = str(message.from_user.id)
+    pool = dp["db_pool"]
+    
+    async with pool.acquire() as conn:
+        exists = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM users WHERE telegram_id = $1)", telegram_id)
+        if exists:
+            await message.reply("Вы уже зарегистрированы! Войдите на сайте.")
+            return
+    
+    user_data[telegram_id] = {"step": "username"}
+    await message.reply("Введите ваш логин:")
+
+@dp.message()
+async def process_input(message: types.Message):
+    telegram_id = str(message.from_user.id)
+    pool = dp["db_pool"]
+    
+    if telegram_id not in user_data or "step" not in user_data[telegram_id]:
+        await message.reply("Начните регистрацию с /start")
+        return
+
+    step = user_data[telegram_id]["step"]
+    
+    async with pool.acquire() as conn:
+        if step == "username":
+            username = message.text.strip()
+            exists = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM users WHERE username = $1)", username)
+            if exists:
+                await message.reply("Логин занят. Выберите другой:")
+                return
+            user_data[telegram_id]["username"] = username
+            user_data[telegram_id]["step"] = "password"
+            await message.reply("Введите пароль:")
+        
+        elif step == "password":
+            password = message.text
+            username = user_data[telegram_id]["username"]
+            
+            try:
+                await register_user(telegram_id, username, password, conn)
+            except Exception as e:
+                await message.reply(f"Ошибка регистрации: {str(e)}. Попробуйте снова с /start")
+                return
+            
+            del user_data[telegram_id]
+            await message.reply(
+                f"✅ Регистрация завершена!\nЛогин: {username}\nПароль: {password}\n"
+                f"Войдите на сайт: {API_BASE_URL}"
+            )
+            await bot.send_message(telegram_id, "Регистрация завершена! Войдите на сайте.")
+
+async def process_notifications():
+    pool = dp["db_pool"]
+    while True:
+        async with pool.acquire() as conn:
+            notifications = await conn.fetch("SELECT * FROM notifications WHERE status = 'pending'")
+            for notification in notifications:
+                try:
+                    await bot.send_message(notification["telegram_id"], notification["text"])
+                    await conn.execute(
+                        "UPDATE notifications SET status = 'sent', sent_at = NOW() WHERE id = $1",
+                        notification["id"]
+                    )
+                    console.log(f"[green]Notification sent to {notification['telegram_id']}: {notification['text']}")
+                except Exception as e:
+                    console.log(f"[red]Error sending notification to {notification['telegram_id']}: {e}")
+                    await conn.execute(
+                        "UPDATE notifications SET status = 'failed', sent_at = NOW() WHERE id = $1",
+                        notification["id"]
+                    )
+        await asyncio.sleep(10)  # Проверять каждые 10 секунд
+
+async def main():
+    pool = await create_db_pool()
+    dp["db_pool"] = pool
+    asyncio.create_task(process_notifications())  # Запускаем задачу обработки уведомлений
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+File: .\app\database.py
+----------------------------------------
+import asyncpg
+from .config import DB_CONFIG
+
+_pool = None
+
+async def init_pool():
+    global _pool
+    print("Connecting with DB_CONFIG:", DB_CONFIG)
+    try:
+        _pool = await asyncpg.create_pool(**DB_CONFIG)
+        print("Database pool initialized successfully")
+    except Exception as e:
+        print(f"Failed to connect to database: {e}")
+        raise
+
+async def close_pool():
+    global _pool
+    if _pool:
+        await _pool.close()
+
+async def get_db_connection():
+    global _pool
+    async with _pool.acquire() as conn:
+        yield conn
+
+File: .\app\main.py
+----------------------------------------
+from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
+from fastapi.exception_handlers import http_exception_handler
+from .auth import get_current_user_from_cookie, get_current_user_from_token, login_for_access_token
+from .database import init_pool, close_pool, get_db_connection
+from .routes import bots, logs, oauth, test_mode
+from .config import COOKIE_NAME, SERVICE_CONFIG, TELEGRAM_BOT_NAME
+import asyncio
+import datetime as dt
+from rich.console import Console
+from .templates_config import templates  # Импортируем templates
+
+
+console = Console()
+
+app = FastAPI()
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+async def send_notification(telegram_id: str, text: str, conn):
+    await conn.execute(
+        "INSERT INTO notifications (telegram_id, text, status, created_at) VALUES ($1, $2, 'pending', NOW())",
+        telegram_id, text
+    )
+
+@app.exception_handler(HTTPException)
+async def custom_http_exception_handler(request: Request, exc: HTTPException):
+    if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+        console.log(f"[yellow]Unauthorized access, redirecting to login")
+        return RedirectResponse(url="/auth/login", status_code=status.HTTP_302_FOUND)
+    return await http_exception_handler(request, exc)
+
+@app.on_event("startup")
+async def startup_event():
+    await init_pool()
+    console.log("[green]Database pool initialized")
+    asyncio.create_task(charge_balance())
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await close_pool()
+
+async def charge_balance():
+    from .database import _pool  # Импортируем пул напрямую
+    while True:
+        async with _pool.acquire() as conn:  # Используем пул напрямую
+            users = await conn.fetch("SELECT * FROM users")
+            for user in users:
+                bots = await conn.fetch("SELECT * FROM bots WHERE user_id = $1 AND status = 'active'", user["id"])
+                if not bots:
+                    continue
+                trial_active = user["trial_end_date"] > dt.datetime.utcnow()
+                total_cost = len(bots) * SERVICE_CONFIG["bot_daily_cost"]
+                
+                if trial_active and len(bots) == 1:
+                    continue
+                
+                if user["balance"] < total_cost:
+                    for bot in bots:
+                        await conn.execute("UPDATE bots SET status = 'stopped' WHERE id = $1", bot["id"])
+                        await send_notification(user["telegram_id"], f"Баланс недостаточен для бота #{bot['id']}. Пополните баланс.", conn)
+                else:
+                    await conn.execute("UPDATE users SET balance = balance - $1 WHERE id = $2", total_cost, user["id"])
+        
+        await asyncio.sleep(86400)  # Каждые 24 часа
+
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request, conn=Depends(get_db_connection)):
+    user = await get_current_user_from_cookie(request, conn)
+    return templates.TemplateResponse("index.html", {"request": request, "user": user, "config": {"TELEGRAM_BOT_NAME": TELEGRAM_BOT_NAME}})
+
+@app.get("/auth/login", response_class=HTMLResponse)
+async def login_get(request: Request):
+    return templates.TemplateResponse("login.html", {"request": request, "errors": []})
+
+@app.post("/auth/login", response_class=HTMLResponse)
+async def login_post(request: Request, conn=Depends(get_db_connection)):
+    form = await request.form()
+    username = form.get("username")
+    password = form.get("password")
+    errors = []
+    if not username:
+        errors.append("Введите логин")
+    if not password:
+        errors.append("Введите пароль")
+    if not errors:
+        try:
+            response = RedirectResponse("/", status_code=status.HTTP_302_FOUND)
+            await login_for_access_token(response=response, username=username, password=password, conn=conn)
+            console.log("[green]Login successful")
+            return response
+        except HTTPException:
+            errors.append("Неверный логин или пароль")
+    return templates.TemplateResponse("login.html", {"request": request, "errors": errors})
+
+@app.get("/auth/logout", response_class=HTMLResponse)
+async def logout():
+    response = RedirectResponse(url="/")
+    response.delete_cookie(COOKIE_NAME)
+    return response
+
+app.include_router(bots.router, prefix="/bots")
+app.include_router(logs.router, prefix="/logs")
+app.include_router(oauth.router, prefix="/oauth")
+app.include_router(test_mode.router, prefix="/test")
+
+File: .\app\run_bot.py
+----------------------------------------
+import asyncio
+from .bot import main
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+File: .\app\models\avito.py
+----------------------------------------
+import json
+import httpx
+from fastapi import HTTPException
+from ..config import AVITO_TOKEN_URL, AVITO_API_URL, AVITO_CLIENT_ID, AVITO_CLIENT_SECRET
+from ..database import get_db_connection
+from ..models.deepseek import query_deepseek
+
+async def get_avito_token(code: str) -> dict:
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            AVITO_TOKEN_URL,
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "client_id": AVITO_CLIENT_ID,
+                "client_secret": AVITO_CLIENT_SECRET
+            }
+        )
+        if response.status_code != 200:
+            raise HTTPException(status_code=400, detail="Ошибка получения токена Avito")
+        return response.json()
+
+async def refresh_avito_token(refresh_token: str) -> dict:
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            AVITO_TOKEN_URL,
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": AVITO_CLIENT_ID,
+                "client_secret": AVITO_CLIENT_SECRET
+            }
+        )
+        if response.status_code != 200:
+            raise HTTPException(status_code=400, detail="Ошибка обновления токена Avito")
+        return response.json()
+
+async def fetch_avito_items(access_token: str, bot_id: int, user_id: str, conn) -> list:
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"{AVITO_API_URL}/items",
+            headers={"Authorization": f"Bearer {access_token}"}
+        )
+        if response.status_code != 200:
+            raise HTTPException(status_code=400, detail="Ошибка получения объявлений Avito")
+        return response.json().get("items", [])
+
+async def process_avito_message(bot_id: int, message: dict, conn, user: dict):
+    bot = await conn.fetchrow("SELECT * FROM bots WHERE id = $1 AND user_id = $2", bot_id, user["id"])
+    if not bot:
+        raise HTTPException(status_code=404, detail="Бот не найден")
+    
+    previous_messages = await conn.fetch(
+        "SELECT text, response FROM messages WHERE bot_id = $1 AND is_test = FALSE ORDER BY timestamp ASC",
+        bot_id
+    )
+    
+    def enhance_prompt(bot: dict) -> str:
+        parameters = json.loads(bot["parameters"])
+        actions = json.loads(bot["actions"])
+        
+        parameters_text = "\n".join(f"[{p['name']}] [{p['description']}]" for p in parameters) if parameters else ""
+        actions_text = "\n".join(f"[{a['name']}] [{a['description']}]" for a in actions) if actions else ""
+        
+        return f"""{bot["prompt"]}
+    
+    В процессе диалога ты должен собрать следующие данные (список параметров):
+    {parameters_text}
+    В каждом ответе обновляй/дополняй данные.
+    
+    В процессе диалога ты должен совершать действия для каждого твоего ответа, если это уместно на данном этапе диалога:
+    {actions_text}
+    
+    Отвечай в формате JSON, который будет иметь такую структуру:
+    {{
+      "response": "string(твой ответ пользователю)",
+      "actions": [{{"action": "string(название действия из списка твоих действий)", "value": "string(параметры действия)"}}, {{"action": "string()", "value": "string()"}}],
+      "parameters": [{{"parameter": "string()", "value": "string()"}}, {{"parameter": "string(название параметра из списка параметров)", "value": "string(значение параметра)"}}]
+    }}"""
+    
+    enhanced_prompt = enhance_prompt(bot)
+    response = await query_deepseek(enhanced_prompt, message["text"], previous_messages, conn, user["telegram_id"])
+    
+    await conn.execute(
+        """
+        INSERT INTO messages (bot_id, text, response, status, is_test, timestamp)
+        VALUES ($1, $2, $3, $4, FALSE, NOW())
+        """,
+        bot_id, message["text"], json.dumps(response, ensure_ascii=False), response.get("status", "Обработано")
+    )
+    
+    return response
+
+File: .\app\models\deepseek.py
+----------------------------------------
+import json
+from openai import OpenAI
+from ..config import DS_API_KEY, DS_API_URL
+from rich.console import Console
+
+console = Console()
+
+async def query_deepseek(prompt: str, message: str, previous_messages: list, conn, telegram_id: str) -> dict:
+    client = OpenAI(api_key=DS_API_KEY, base_url=DS_API_URL)
+    
+    # Формируем историю сообщений
+    messages = [{"role": "system", "content": prompt}]
+    for msg in previous_messages:
+        messages.append({"role": "user", "content": msg["text"]})
+        if msg["response"]:
+            try:
+                json_response = json.loads(msg["response"])
+                messages.append({"role": "assistant", "content": json.dumps(json_response, ensure_ascii=False)})
+            except json.JSONDecodeError:
+                messages.append({"role": "assistant", "content": msg["response"]})
+    
+    # Добавляем текущее сообщение
+    messages.append({"role": "user", "content": message})
+    
+    for _ in range(2):
+        try:
+            response = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=messages,
+                stream=False,
+                response_format={'type': 'json_object'},
+                temperature=1.0
+            )
+            raw_answer = response.choices[0].message.content
+            json_response = json.loads(raw_answer)
+            
+            # Проверяем наличие обязательных полей
+            if not all(key in json_response for key in ["response", "actions", "parameters"]):
+                console.log(f"[red]Invalid JSON format: {raw_answer}")
+                continue
+            
+            # Выполняем действия
+            for action in json_response.get("actions", []):
+                if action.get("action") == "уведомить":
+                    await conn.execute(
+                        "INSERT INTO notifications (telegram_id, text, status, created_at) VALUES ($1, $2, 'pending', NOW())",
+                        telegram_id,
+                        action.get("value")
+                    )
+                    console.log(f"[green]Notification added: {action.get('value')}")
+            
+            return json_response
+        except json.JSONDecodeError as e:
+            console.log(f"[red]JSON Parse Error: {e}, raw: {raw_answer}")
+        except Exception as e:
+            console.log(f"[red]DeepSeek Error: {e}")
+    
+    return {
+        "response": "Свяжемся позже",
+        "actions": [],
+        "parameters": [],
+        "status": "Требуется ручная обработка"
+    }
+
+File: .\app\routes\bots.py
+----------------------------------------
+from fastapi import APIRouter, Depends, Request, Form, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse
+from ..templates_config import templates
+from ..auth import get_current_user_from_token
+from ..database import get_db_connection
+from ..models.avito import fetch_avito_items
+from ..config import SERVICE_CONFIG
+import datetime as dt
+import json
+import re
+
+router = APIRouter()
+
+async def send_notification(telegram_id: str, text: str, conn):
+    await conn.execute(
+        "INSERT INTO notifications (telegram_id, text, status, created_at) VALUES ($1, $2, 'pending', NOW())",
+        telegram_id, text
+    )
+
+def validate_format(text: str, field_name: str) -> list:
+    if not text.strip():
+        return []
+    lines = text.strip().split("\n")
+    result = []
+    pattern = r"^\[([^\]]+)\]\s+\[(.+)\]$"
+    for line in lines:
+        match = re.match(pattern, line.strip())
+        if not match:
+            raise HTTPException(status_code=400, detail=f"Неверный формат строки в {field_name}: {line}")
+        name, description = match.groups()
+        result.append({"name": name, "description": description})
+    return result
+
+@router.get("/", response_class=HTMLResponse)
+async def bots_page(request: Request, user: dict = Depends(get_current_user_from_token), conn=Depends(get_db_connection)):
+    bots = await conn.fetch("SELECT b.*, t.access_token FROM bots b LEFT JOIN tokens t ON b.id = t.bot_id WHERE b.user_id = $1", user["id"])
+    trial_active = user["trial_end_date"] > dt.datetime.utcnow()
+    return templates.TemplateResponse("bots.html", {"request": request, "user": user, "bots": bots, "trial_active": trial_active})
+
+@router.post("/create", response_class=RedirectResponse)
+async def create_bot(
+    request: Request,
+    prompt: str = Form(...),
+    parameters: str = Form(default=""),
+    actions: str = Form(default=""),
+    user: dict = Depends(get_current_user_from_token),
+    conn=Depends(get_db_connection)
+):
+    bot_count = await conn.fetchval("SELECT COUNT(*) FROM bots WHERE user_id = $1", user["id"])
+    trial_active = user["trial_end_date"] > dt.datetime.utcnow()
+    
+    if bot_count >= 1 and not trial_active and user["balance"] < SERVICE_CONFIG["bot_daily_cost"]:
+        await send_notification(user["telegram_id"], "Недостаточно средств для создания бота. Пополните баланс.", conn)
+        raise HTTPException(status_code=400, detail="Недостаточно средств")
+    
+    try:
+        parameters_json = validate_format(parameters, "parameters")
+        actions_json = validate_format(actions, "actions")
+    except HTTPException as e:
+        raise e
+    
+    await conn.execute(
+        """
+        INSERT INTO bots (user_id, prompt, status, items, is_authorized, parameters, actions)
+        VALUES ($1, $2, 'stopped', NULL, FALSE, $3, $4)
+        """,
+        user["id"], prompt, json.dumps(parameters_json), json.dumps(actions_json)
+    )
+    bot_id = await conn.fetchval("SELECT id FROM bots WHERE user_id = $1 ORDER BY ID DESC LIMIT 1", user["id"])
+    await send_notification(user["telegram_id"], f"Бот #{bot_id} создан!", conn)
+    return RedirectResponse(url="/bots", status_code=303)
+
+@router.get("/{bot_id}/edit", response_class=HTMLResponse)
+async def edit_bot_page(
+    bot_id: int, request: Request, user: dict = Depends(get_current_user_from_token), conn=Depends(get_db_connection)
+):
+    bot = await conn.fetchrow("SELECT * FROM bots WHERE id = $1 AND user_id = $2", bot_id, user["id"])
+    if not bot:
+        raise HTTPException(status_code=404, detail="Бот не найден")
+    return templates.TemplateResponse("edit_prompt.html", {"request": request, "user": user, "bot": bot, "errors": []})
+
+@router.post("/{bot_id}/update", response_class=RedirectResponse)
+async def update_bot(
+    bot_id: int,
+    prompt: str = Form(...),
+    parameters: str = Form(default=""),
+    actions: str = Form(default=""),
+    user: dict = Depends(get_current_user_from_token),
+    conn=Depends(get_db_connection)
+):
+    bot = await conn.fetchrow("SELECT * FROM bots WHERE id = $1 AND user_id = $2", bot_id, user["id"])
+    if not bot:
+        raise HTTPException(status_code=404, detail="Бот не найден")
+    
+    try:
+        parameters_json = validate_format(parameters, "parameters")
+        actions_json = validate_format(actions, "actions")
+    except HTTPException as e:
+        raise e
+    
+    await conn.execute(
+        "UPDATE bots SET prompt = $1, parameters = $2, actions = $3 WHERE id = $4",
+        prompt, json.dumps(parameters_json), json.dumps(actions_json), bot_id
+    )
+    await send_notification(user["telegram_id"], f"Промпт бота #{bot_id} обновлен.", conn)
+    return RedirectResponse(url="/bots", status_code=303)
+
+@router.post("/{bot_id}/activate", response_class=RedirectResponse)
+async def activate_bot(
+    bot_id: int, user: dict = Depends(get_current_user_from_token), conn=Depends(get_db_connection)
+):
+    bot = await conn.fetchrow("SELECT * FROM bots WHERE id = $1 AND user_id = $2", bot_id, user["id"])
+    if not bot:
+        raise HTTPException(status_code=404, detail="Бот не найден")
+    
+    if not bot["is_authorized"]:
+        await send_notification(user["telegram_id"], f"Бот #{bot_id} не может быть активирован: привяжите аккаунт Avito.", conn)
+        raise HTTPException(status_code=400, detail="Привяжите аккаунт Avito")
+    
+    if bot["items"] is None:
+        await send_notification(user["telegram_id"], f"Бот #{bot_id} не может быть активирован: выберите объявления.", conn)
+        raise HTTPException(status_code=400, detail="Выберите объявления")
+    
+    trial_active = user["trial_end_date"] > dt.datetime.utcnow()
+    if not trial_active and user["balance"] < SERVICE_CONFIG["bot_daily_cost"]:
+        await send_notification(user["telegram_id"], f"Недостаточно средств для активации бота #{bot_id}. Пополните баланс.", conn)
+        raise HTTPException(status_code=400, detail="Недостаточно средств")
+    
+    await conn.execute("UPDATE bots SET status = 'active' WHERE id = $1", bot_id)
+    await send_notification(user["telegram_id"], f"Бот #{bot_id} активирован!", conn)
+    return RedirectResponse(url="/bots", status_code=303)
+
+@router.post("/{bot_id}/stop", response_class=RedirectResponse)
+async def stop_bot(
+    bot_id: int, user: dict = Depends(get_current_user_from_token), conn=Depends(get_db_connection)
+):
+    bot = await conn.fetchrow("SELECT * FROM bots WHERE id = $1 AND user_id = $2", bot_id, user["id"])
+    if not bot:
+        raise HTTPException(status_code=404, detail="Бот не найден")
+    await conn.execute("UPDATE bots SET status = 'stopped' WHERE id = $1", bot_id)
+    await send_notification(user["telegram_id"], f"Бот #{bot_id} остановлен.", conn)
+    return RedirectResponse(url="/bots", status_code=303)
+
+@router.post("/{bot_id}/delete", response_class=RedirectResponse)
+async def delete_bot(
+    bot_id: int, user: dict = Depends(get_current_user_from_token), conn=Depends(get_db_connection)
+):
+    bot = await conn.fetchrow("SELECT * FROM bots WHERE id = $1 AND user_id = $2", bot_id, user["id"])
+    if not bot:
+        raise HTTPException(status_code=404, detail="Бот не найден")
+    
+    await conn.execute("DELETE FROM tokens WHERE bot_id = $1", bot_id)
+    await conn.execute("DELETE FROM messages WHERE bot_id = $1", bot_id)
+    await conn.execute("DELETE FROM notifications WHERE telegram_id = $1 AND text LIKE $2", user["telegram_id"], f"%Бот #{bot_id}%")
+    await conn.execute("DELETE FROM bots WHERE id = $1", bot_id)
+    
+    await send_notification(user["telegram_id"], f"Бот #{bot_id} удален.", conn)
+    return RedirectResponse(url="/bots", status_code=303)
+
+@router.get("/{bot_id}/edit-items", response_class=HTMLResponse)
+async def edit_items_page(
+    bot_id: int,
+    request: Request,
+    user: dict = Depends(get_current_user_from_token),
+    conn=Depends(get_db_connection)
+):
+    bot = await conn.fetchrow("SELECT * FROM bots WHERE id = $1 AND user_id = $2", bot_id, user["id"])
+    if not bot:
+        raise HTTPException(status_code=404, detail="Бот не найден")
+    
+    if not bot["is_authorized"]:
+        raise HTTPException(status_code=400, detail="Аккаунт Avito не привязан")
+    
+    token = await conn.fetchrow("SELECT access_token FROM tokens WHERE bot_id = $1", bot_id)
+    if not token:
+        raise HTTPException(status_code=400, detail="Аккаунт Avito не привязан")
+    
+    try:
+        items = await fetch_avito_items(token["access_token"], bot_id, user["id"], conn)
+    except HTTPException as e:
+        await send_notification(user["telegram_id"], f"Ошибка получения объявлений для бота #{bot_id}: {e.detail}", conn)
+        return templates.TemplateResponse(
+            "select_items.html",
+            {"request": request, "user": user, "bot": bot, "items": [], "errors": [e.detail]}
+        )
+    
+    return templates.TemplateResponse(
+        "select_items.html",
+        {"request": request, "user": user, "bot": bot, "items": items, "errors": []}
+    )
+
+@router.get("/order-prompt", response_class=HTMLResponse)
+async def order_prompt_page(request: Request, user: dict = Depends(get_current_user_from_token)):
+    return templates.TemplateResponse("order_prompt.html", {"request": request, "user": user})
+
+@router.get("/balance", response_class=HTMLResponse)
+async def balance_page(request: Request, user: dict = Depends(get_current_user_from_token)):
+    return templates.TemplateResponse("balance.html", {"request": request, "user": user, "SERVICE_CONFIG": SERVICE_CONFIG})
+
+@router.get("/top-up", response_class=HTMLResponse)
+async def top_up_page(request: Request, user: dict = Depends(get_current_user_from_token)):
+    return templates.TemplateResponse("top_up.html", {"request": request, "user": user})
+
+File: .\app\routes\logs.py
+----------------------------------------
+from fastapi import APIRouter, Depends, Request, HTTPException
+from fastapi.responses import HTMLResponse
+from ..templates_config import templates
+from ..auth import get_current_user_from_token
+from ..database import get_db_connection
+
+router = APIRouter()
+
+@router.get("/{bot_id}", response_class=HTMLResponse)
+async def logs_page(
+    bot_id: int, request: Request, user: dict = Depends(get_current_user_from_token), conn=Depends(get_db_connection)
+):
+    bot = await conn.fetchrow("SELECT * FROM bots WHERE id = $1 AND user_id = $2", bot_id, user["id"])
+    if not bot:
+        raise HTTPException(status_code=404, detail="Бот не найден")
+    messages = await conn.fetch("SELECT * FROM messages WHERE bot_id = $1 ORDER BY timestamp DESC", bot_id)
+    return templates.TemplateResponse("logs.html", {"request": request, "user": user, "bot": bot, "messages": messages})
+
+File: .\app\routes\oauth.py
+----------------------------------------
+from fastapi import APIRouter, Depends, HTTPException, Request, Form
+from fastapi.responses import RedirectResponse, HTMLResponse
+from ..templates_config import templates
+from ..auth import get_current_user_from_token
+from ..database import get_db_connection
+from ..models.avito import get_avito_token, fetch_avito_items
+from ..config import AVITO_AUTH_URL, AVITO_CLIENT_ID, AVITO_REDIRECT_URI
+import datetime as dt
+
+router = APIRouter()
+
+async def send_notification(telegram_id: str, text: str, conn):
+    await conn.execute(
+        "INSERT INTO notifications (telegram_id, text, status, created_at) VALUES ($1, $2, 'pending', NOW())",
+        telegram_id, text
+    )
+
+@router.get("/avito", response_class=RedirectResponse)
+async def avito_auth(bot_id: int, user: dict = Depends(get_current_user_from_token), conn=Depends(get_db_connection)):
+    bot = await conn.fetchrow("SELECT * FROM bots WHERE id = $1 AND user_id = $2", bot_id, user["id"])
+    if not bot:
+        raise HTTPException(status_code=404, detail="Бот не найден")
+    auth_url = f"{AVITO_AUTH_URL}?client_id={AVITO_CLIENT_ID}&redirect_uri={AVITO_REDIRECT_URI}&response_type=code&state={bot_id}"
+    return RedirectResponse(url=auth_url)
+
+@router.get("/avito/callback")
+async def avito_callback(code: str, state: str, user: dict = Depends(get_current_user_from_token), conn=Depends(get_db_connection)):
+    bot_id = int(state)
+    bot = await conn.fetchrow("SELECT * FROM bots WHERE id = $1 AND user_id = $2", bot_id, user["id"])
+    if not bot:
+        raise HTTPException(status_code=404, detail="Бот не найден")
+    
+    existing_token = await conn.fetchrow("SELECT * FROM tokens WHERE access_token IN (SELECT access_token FROM tokens WHERE bot_id != $1)", bot_id)
+    if existing_token:
+        await conn.execute("UPDATE bots SET status = 'stopped' WHERE id = $1", existing_token["bot_id"])
+        await send_notification(user["telegram_id"], f"Аккаунт Avito переключен на бота #{bot_id}. Предыдущий бот #{existing_token['bot_id']} остановлен.", conn)
+    
+    token_data = await get_avito_token(code)
+    expires_at = dt.datetime.utcnow() + dt.timedelta(seconds=token_data["expires_in"])
+    await conn.execute(
+        """
+        INSERT INTO tokens (bot_id, access_token, refresh_token, expires_at)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (bot_id) DO UPDATE SET access_token = $2, refresh_token = $3, expires_at = $4
+        """,
+        bot_id, token_data["access_token"], token_data.get("refresh_token"), expires_at
+    )
+    await conn.execute("UPDATE bots SET is_authorized = TRUE WHERE id = $1", bot_id)
+    await send_notification(user["telegram_id"], f"Аккаунт Avito подключен к боту #{bot_id}.", conn)
+    return RedirectResponse(url=f"/oauth/avito/select-items/{bot_id}", status_code=303)
+
+@router.get("/avito/select-items/{bot_id}", response_class=HTMLResponse)
+async def select_items_page(
+    bot_id: int,
+    request: Request,
+    user: dict = Depends(get_current_user_from_token),
+    conn=Depends(get_db_connection)
+):
+    bot = await conn.fetchrow("SELECT * FROM bots WHERE id = $1 AND user_id = $2", bot_id, user["id"])
+    if not bot:
+        raise HTTPException(status_code=404, detail="Бот не найден")
+    
+    if not bot["is_authorized"]:
+        raise HTTPException(status_code=400, detail="Аккаунт Avito не привязан")
+    
+    token = await conn.fetchrow("SELECT access_token FROM tokens WHERE bot_id = $1", bot_id)
+    if not token:
+        raise HTTPException(status_code=400, detail="Аккаунт Avito не привязан")
+    
+    try:
+        items = await fetch_avito_items(token["access_token"], bot_id, user["id"], conn)
+    except HTTPException as e:
+        await send_notification(user["telegram_id"], f"Ошибка получения объявлений для бота #{bot_id}: {e.detail}", conn)
+        return templates.TemplateResponse(
+            "select_items.html",
+            {"request": request, "user": user, "bot": bot, "items": [], "errors": [e.detail]}
+        )
+    
+    return templates.TemplateResponse(
+        "select_items.html",
+        {"request": request, "user": user, "bot": bot, "items": items, "errors": []}
+    )
+
+@router.post("/avito/select-items/{bot_id}", response_class=RedirectResponse)
+async def save_selected_items(
+    bot_id: int,
+    item_ids: list[str] = Form(default=[]),
+    user: dict = Depends(get_current_user_from_token),
+    conn=Depends(get_db_connection)
+):
+    bot = await conn.fetchrow("SELECT * FROM bots WHERE id = $1 AND user_id = $2", bot_id, user["id"])
+    if not bot:
+        raise HTTPException(status_code=404, detail="Бот не найден")
+    
+    if not bot["is_authorized"]:
+        raise HTTPException(status_code=400, detail="Аккаунт Avito не привязан")
+    
+    token = await conn.fetchrow("SELECT access_token FROM tokens WHERE bot_id = $1", bot_id)
+    if not token:
+        raise HTTPException(status_code=400, detail="Аккаунт Avito не привязан")
+    
+    try:
+        items = await fetch_avito_items(token["access_token"], bot_id, user["id"], conn)
+        if not items:
+            items_data = {"all": True}
+        else:
+            items_data = {"all": False, "items": item_ids}
+        
+        await conn.execute(
+            "UPDATE bots SET items = $1 WHERE id = $2",
+            items_data, bot_id
+        )
+    except HTTPException as e:
+        await send_notification(user["telegram_id"], f"Ошибка сохранения объявлений для бота #{bot_id}: {e.detail}", conn)
+        return RedirectResponse(url="/bots", status_code=303)
+    
+    return RedirectResponse(url="/bots", status_code=303)
+
+File: .\app\routes\test_mode.py
+----------------------------------------
+from fastapi import APIRouter, Depends, Request, Form, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse
+from ..auth import get_current_user_from_token
+from ..database import get_db_connection
+from ..models.deepseek import query_deepseek
+from ..templates_config import templates
+import datetime as dt
+import json
+
+router = APIRouter()
+
+@router.get("/{bot_id}", response_class=HTMLResponse)
+async def test_mode_page(
+    bot_id: int, request: Request, user: dict = Depends(get_current_user_from_token), conn=Depends(get_db_connection)
+):
+    bot = await conn.fetchrow("SELECT * FROM bots WHERE id = $1 AND user_id = $2", bot_id, user["id"])
+    if not bot:
+        raise HTTPException(status_code=404, detail="Бот не найден")
+    messages = await conn.fetch(
+        "SELECT * FROM messages WHERE bot_id = $1 AND is_test = TRUE ORDER BY timestamp DESC", bot_id
+    )
+    return templates.TemplateResponse(
+        "test_mode.html", {"request": request, "user": user, "bot": bot, "messages": messages}
+    )
+
+@router.post("/{bot_id}/send", response_class=RedirectResponse)
+async def send_test_message(
+    bot_id: int,
+    message: str = Form(...),
+    user: dict = Depends(get_current_user_from_token),
+    conn=Depends(get_db_connection),
+):
+    bot = await conn.fetchrow("SELECT * FROM bots WHERE id = $1 AND user_id = $2", bot_id, user["id"])
+    if not bot:
+        raise HTTPException(status_code=404, detail="Бот не найден")
+
+    previous_messages = await conn.fetch(
+        "SELECT text, response FROM messages WHERE bot_id = $1 AND is_test = TRUE ORDER BY timestamp DESC", bot_id
+    )
+
+    def enhance_prompt(prompt: str, parameters: str, actions: str):
+        param_list = json.loads(parameters) if parameters else []
+        action_list = json.loads(actions) if actions else []
+        enhanced = (
+            f"{prompt}\n\n"
+            f"Доступные параметры: {', '.join([p['name'] for p in param_list])}\n"
+            f"Доступные действия: {', '.join([a['name'] for a in action_list])}\n"
+            "Отвечай строго в формате JSON с полями: response (строка), actions (массив объектов), parameters (массив объектов), status (строка)."
+        )
+        return enhanced
+
+    prompt = enhance_prompt(bot["prompt"], bot["parameters"], bot["actions"])
+    response = await query_deepseek(
+        prompt=prompt,
+        message=message,
+        previous_messages=previous_messages,
+        conn=conn,
+        telegram_id=user["telegram_id"],
+    )
+
+    await conn.execute(
+        """
+        INSERT INTO messages (bot_id, text, response, status, is_test, timestamp)
+        VALUES ($1, $2, $3, $4, TRUE, NOW())
+        """,
+        bot_id,
+        message,
+        json.dumps(response, ensure_ascii=False),
+        response.get("status", "Обработано"),
+    )
+
+    await conn.execute(
+        "INSERT INTO notifications (telegram_id, text, status, created_at) VALUES ($1, $2, 'pending', NOW())",
+        user["telegram_id"],
+        f"Тестовое сообщение для бота #{bot_id} обработано.",
+    )
+
+    return RedirectResponse(url=f"/test/{bot_id}", status_code=303)
+
+@router.post("/{bot_id}/reset", response_class=RedirectResponse)
+async def reset_test_messages(
+    bot_id: int, user: dict = Depends(get_current_user_from_token), conn=Depends(get_db_connection)
+):
+    bot = await conn.fetchrow("SELECT * FROM bots WHERE id = $1 AND user_id = $2", bot_id, user["id"])
+    if not bot:
+        raise HTTPException(status_code=404, detail="Бот не найден")
+
+    await conn.execute("DELETE FROM messages WHERE bot_id = $1 AND is_test = TRUE", bot_id)
+
+    await conn.execute(
+        "INSERT INTO notifications (telegram_id, text, status, created_at) VALUES ($1, $2, 'pending', NOW())",
+        user["telegram_id"],
+        f"Тестовый диалог для бота #{bot_id} сброшен.",
+    )
+
+    return RedirectResponse(url=f"/test/{bot_id}", status_code=303)
+

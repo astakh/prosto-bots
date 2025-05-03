@@ -1,0 +1,114 @@
+==================================================
+Directory: .
+==================================================
+
+File: .\db_schema.txt
+----------------------------------------
+Таблица             |Столбец             |Тип данных     |Nullable  |Значение по умолчанию         |Ограничения                             
+--------------------------------------------------------------------------------------------------------------------------------------------
+bots                |id                  |integer        |NOT NULL  |nextval('bots_id_seq'::regclas|PRIMARY KEY                             
+bots                |user_id             |integer        |NULL      |                              |FOREIGN KEY -> users.id                 
+bots                |prompt              |text           |NOT NULL  |                              |                                        
+bots                |status              |character varyi|NOT NULL  |'stopped'::character varying  |                                        
+bots                |items               |jsonb          |NULL      |                              |                                        
+bots                |is_authorized       |boolean        |NOT NULL  |false                         |                                        
+bots                |parameters          |jsonb          |NOT NULL  |'[]'::jsonb                   |                                        
+bots                |actions             |jsonb          |NOT NULL  |'[]'::jsonb                   |                                        
+messages            |id                  |integer        |NOT NULL  |nextval('messages_id_seq'::reg|PRIMARY KEY                             
+messages            |bot_id              |integer        |NULL      |                              |FOREIGN KEY -> bots.id                  
+messages            |ad_id               |character varyi|NULL      |                              |                                        
+messages            |text                |text           |NOT NULL  |                              |                                        
+messages            |response            |text           |NULL      |                              |                                        
+messages            |timestamp           |timestamp witho|NOT NULL  |now()                         |                                        
+messages            |status              |character varyi|NOT NULL  |                              |                                        
+messages            |is_test             |boolean        |NULL      |false                         |                                        
+notifications       |id                  |integer        |NOT NULL  |nextval('notifications_id_seq'|PRIMARY KEY                             
+notifications       |telegram_id         |character varyi|NOT NULL  |                              |                                        
+notifications       |text                |text           |NOT NULL  |                              |                                        
+notifications       |status              |character varyi|NOT NULL  |'pending'::character varying  |                                        
+notifications       |created_at          |timestamp witho|NOT NULL  |now()                         |                                        
+notifications       |sent_at             |timestamp witho|NULL      |                              |                                        
+tokens              |id                  |integer        |NOT NULL  |nextval('tokens_id_seq'::regcl|PRIMARY KEY                             
+tokens              |bot_id              |integer        |NULL      |                              |FOREIGN KEY -> bots.id                  
+tokens              |access_token        |character varyi|NOT NULL  |                              |                                        
+tokens              |refresh_token       |character varyi|NULL      |                              |                                        
+tokens              |expires_at          |timestamp witho|NOT NULL  |                              |                                        
+users               |id                  |integer        |NOT NULL  |nextval('users_id_seq'::regcla|PRIMARY KEY                             
+users               |telegram_id         |character varyi|NOT NULL  |                              |UNIQUE                                  
+users               |username            |character varyi|NOT NULL  |                              |UNIQUE                                  
+users               |password_hash       |character varyi|NOT NULL  |                              |                                        
+users               |registration_date   |timestamp witho|NOT NULL  |now()                         |                                        
+users               |trial_end_date      |timestamp witho|NOT NULL  |                              |                                        
+users               |balance             |numeric        |NULL      |0.00                          |                                        
+
+
+File: .\model.py
+----------------------------------------
+from openai import OpenAI
+from config import DS_API_KEY, DS_API_URL
+import json
+import re
+
+def clean_json_string(raw_string):
+    if not isinstance(raw_string, str):
+        return raw_string
+    json_match = re.search(r'\{.*\}', raw_string, re.DOTALL)
+    if json_match:
+        cleaned = json_match.group(0)
+        cleaned = re.sub(r'[^\x20-\x7E\n\t]', '', cleaned)
+        return cleaned
+    return raw_string.strip()
+
+async def query_model(messages):
+    client = OpenAI(api_key=DS_API_KEY, base_url=DS_API_URL)
+
+    # Добавляем инструкцию в конец сообщений, чтобы LLM вернула JSON
+    messages_with_instruction = messages.copy() 
+
+    not_first_trying = False
+    for i in range(2):
+        if not_first_trying:
+            messages_with_instruction.append({'role': 'user', 'content': 'Верни ответ в формате JSON!'})
+        try:
+            response = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=messages_with_instruction,
+                stream=False,
+                response_format={ 'type': 'json_object' },
+                temperature=1.4
+            )
+            raw_answer = response.choices[0].message.content 
+
+            # Очищаем и парсим JSON
+            cleaned_answer = raw_answer #  clean_json_string(raw_answer)
+            answer_json = json.loads(cleaned_answer)    
+
+            
+            return answer_json
+
+        except json.JSONDecodeError as e:
+            print(f"Ошибка парсинга JSON: {e}, raw: {raw_answer}")
+            not_first_trying = True
+        except Exception as e:
+            print(f"Ошибка при получении ответа: {e}")
+            not_first_trying = True
+
+    return {"response_to_user": "Извините, не удалось получить корректный ответ от модели."}
+
+File: .\requirements.txt
+----------------------------------------
+fastapi==0.115.0
+uvicorn==0.30.6
+gunicorn==22.0.0
+asyncpg==0.29.0
+httpx==0.27.2
+aiogram==3.13.1
+passlib[bcrypt]==1.7.4
+bcrypt==4.1.2
+pyjwt==2.9.0
+jinja2==3.1.4
+python-dotenv==1.0.1
+openai==1.47.0
+rich==13.8.1
+python-multipart==0.0.9
+

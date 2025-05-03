@@ -1,0 +1,25 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.env
+app/config.py
+
+# Логи
+*.log
+
+# Временные файлы
+*.bak
+*.swp
+*~
+
+# Статические файлы (если они генерируются)
+static/*.cache
+
+# База данных
+*.sql
+*.sqlite3
