@@ -4,6 +4,7 @@ from fastapi import HTTPException
 from ..config import AVITO_TOKEN_URL, AVITO_API_URL, AVITO_CLIENT_ID, AVITO_CLIENT_SECRET
 from ..database import get_db_connection
 from ..models.deepseek import query_deepseek
+import datetime as dt
 
 async def get_avito_token(code: str) -> dict:
     async with httpx.AsyncClient() as client:
@@ -35,7 +36,28 @@ async def refresh_avito_token(refresh_token: str) -> dict:
             raise HTTPException(status_code=400, detail="Ошибка обновления токена Avito")
         return response.json()
 
-async def fetch_avito_items(access_token: str, bot_id: int, user_id: str, conn) -> list:
+async def get_valid_token(bot_id: int, conn) -> str:
+    token = await conn.fetchrow("SELECT * FROM tokens WHERE bot_id = $1", bot_id)
+    if not token:
+        raise HTTPException(status_code=400, detail="Токен для бота не найден")
+    
+    if token["expires_at"] < dt.datetime.utcnow():
+        token_data = await refresh_avito_token(token["refresh_token"])
+        expires_at = dt.datetime.utcnow() + dt.timedelta(seconds=token_data["expires_in"])
+        await conn.execute(
+            """
+            UPDATE tokens 
+            SET access_token = $1, refresh_token = $2, expires_at = $3
+            WHERE bot_id = $4
+            """,
+            token_data["access_token"], token_data.get("refresh_token"), expires_at, bot_id
+        )
+        return token_data["access_token"]
+    
+    return token["access_token"]
+
+async def fetch_avito_items(bot_id: int, user_id: str, conn) -> list:
+    access_token = await get_valid_token(bot_id, conn)
     async with httpx.AsyncClient() as client:
         response = await client.get(
             f"{AVITO_API_URL}/items",

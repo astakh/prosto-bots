@@ -20,7 +20,7 @@ async def avito_auth(bot_id: int, user: dict = Depends(get_current_user_from_tok
     bot = await conn.fetchrow("SELECT * FROM bots WHERE id = $1 AND user_id = $2", bot_id, user["id"])
     if not bot:
         raise HTTPException(status_code=404, detail="Бот не найден")
-    auth_url = f"{AVITO_AUTH_URL}?client_id={AVITO_CLIENT_ID}&redirect_uri={AVITO_REDIRECT_URI}&response_type=code&state={bot_id}"
+    auth_url = f"{AVITO_AUTH_URL}?client_id={AVITO_CLIENT_ID}&redirect_uri={AVITO_REDIRECT_URI}&response_type=code&state={bot_id}&scope=messenger:read,messenger:write,items:info"
     return RedirectResponse(url=auth_url)
 
 @router.get("/avito/callback")
