@@ -1,7 +1,7 @@
 import json
 import httpx
 from fastapi import HTTPException
-from ..config import AVITO_TOKEN_URL, AVITO_API_URL, AVITO_CLIENT_ID, AVITO_CLIENT_SECRET
+from ..config import AVITO_TOKEN_URL, AVITO_API_URL, AVITO_CLIENT_ID, AVITO_CLIENT_SECRET, AVITO_API_URL_ITEMS
 from ..database import get_db_connection
 from ..models.deepseek import query_deepseek
 import datetime as dt
@@ -57,14 +57,17 @@ async def get_valid_token(bot_id: int, conn) -> str:
     return token["access_token"]
 
 async def fetch_avito_items(bot_id: int, user_id: str, conn) -> list:
+    print("go fetch_avito_items")
     access_token = await get_valid_token(bot_id, conn)
     async with httpx.AsyncClient() as client:
         response = await client.get(
-            f"{AVITO_API_URL}/items",
+            f"{AVITO_API_URL_ITEMS}",
             headers={"Authorization": f"Bearer {access_token}"}
         )
+        print(response)
         if response.status_code != 200:
             raise HTTPException(status_code=400, detail="Ошибка получения объявлений Avito")
+         
         return response.json().get("items", [])
 
 async def process_avito_message(bot_id: int, message: dict, conn, user: dict):
