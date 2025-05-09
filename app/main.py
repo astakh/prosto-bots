@@ -15,7 +15,12 @@ from .routes.bots_delete import router as bots_delete_router
 from .routes.bots_edit_items import router as bots_edit_items_router
 from .routes.bots_order_prompt import router as bots_order_prompt_router
 from .routes.balance import router as balance_router
-from .routes import logs, oauth, test_mode
+from .routes import logs, test_mode
+from .routes.oauth_avito import router as oauth_avito_router
+from .routes.oauth_avito_callback import router as oauth_avito_callback_router
+from .routes.oauth_select_items_get import router as oauth_select_items_get_router
+from .routes.oauth_select_items_post import router as oauth_select_items_post_router
+from .routes.avito_webhook import router as avito_webhook_router
 from .config import COOKIE_NAME, SERVICE_CONFIG, TELEGRAM_BOT_NAME
 from .utils import send_notification
 import asyncio
@@ -115,5 +120,9 @@ app.include_router(bots_edit_items_router, prefix="/bots")
 app.include_router(bots_order_prompt_router, prefix="/bots")
 app.include_router(balance_router)
 app.include_router(logs.router, prefix="/logs")
-app.include_router(oauth.router, prefix="/oauth")
+app.include_router(oauth_avito_router, prefix="/oauth")
+app.include_router(oauth_avito_callback_router, prefix="/oauth")
+app.include_router(oauth_select_items_get_router, prefix="/oauth")
+app.include_router(oauth_select_items_post_router, prefix="/oauth")
 app.include_router(test_mode.router, prefix="/test")
+app.include_router(avito_webhook_router, prefix="/avito")
