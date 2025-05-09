@@ -68,7 +68,7 @@ async def fetch_avito_items(bot_id: int, user_id: str, conn) -> list:
         if response.status_code != 200:
             raise HTTPException(status_code=400, detail="Ошибка получения объявлений Avito")
          
-        return response.json().get("items", [])
+        return response.json().get("resources", [])
 
 async def process_avito_message(bot_id: int, message: dict, conn, user: dict):
     bot = await conn.fetchrow("SELECT * FROM bots WHERE id = $1 AND user_id = $2", bot_id, user["id"])
