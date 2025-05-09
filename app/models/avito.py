@@ -1,12 +1,15 @@
 import json
 import httpx
 from fastapi import HTTPException
-from ..config import AVITO_TOKEN_URL, AVITO_API_URL, AVITO_CLIENT_ID, AVITO_CLIENT_SECRET, AVITO_API_URL_ITEMS
+from ..config import AVITO_TOKEN_URL, AVITO_API_URL, AVITO_CLIENT_ID, AVITO_CLIENT_SECRET, AVITO_API_URL_ITEMS, AVITO_WEBHOOK_URL
 from ..database import get_db_connection
 from ..models.deepseek import query_deepseek
 import datetime as dt
+from rich.console import Console
 
-async def get_avito_token(code: str) -> dict:
+console = Console()
+
+async def get_avito_token(code: str, bot_id: int) -> dict:
     async with httpx.AsyncClient() as client:
         response = await client.post(
             AVITO_TOKEN_URL,
@@ -18,8 +21,26 @@ async def get_avito_token(code: str) -> dict:
             }
         )
         if response.status_code != 200:
+            console.log(f"[red]Ошибка получения токена Avito: {response.status_code}, {response.text}")
             raise HTTPException(status_code=400, detail="Ошибка получения токена Avito")
-        return response.json()
+        
+        token_data = response.json()
+        # Save token to database
+        async with get_db_connection() as conn:
+            expires_at = dt.datetime.utcnow() + dt.timedelta(seconds=token_data["expires_in"])
+            await conn.execute(
+                """
+                INSERT INTO tokens (bot_id, access_token, refresh_token, expires_at, scope)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (bot_id) DO UPDATE
+                SET access_token = $2, refresh_token = $3, expires_at = $4, scope = $5
+                """,
+                bot_id, token_data["access_token"], token_data.get("refresh_token"), expires_at, token_data.get("scope")
+            )
+            # Subscribe to webhooks
+            await subscribe_avito_webhook(bot_id, token_data["access_token"], token_data["user_id"])
+        
+        return token_data
 
 async def refresh_avito_token(refresh_token: str) -> dict:
     async with httpx.AsyncClient() as client:
@@ -33,6 +54,7 @@ async def refresh_avito_token(refresh_token: str) -> dict:
             }
         )
         if response.status_code != 200:
+            console.log(f"[red]Ошибка обновления токена Avito: {response.status_code}, {response.text}")
             raise HTTPException(status_code=400, detail="Ошибка обновления токена Avito")
         return response.json()
 
@@ -56,19 +78,33 @@ async def get_valid_token(bot_id: int, conn) -> str:
     
     return token["access_token"]
 
+async def subscribe_avito_webhook(bot_id: int, access_token: str, account_id: int):
+    webhook_url = f"{AVITO_WEBHOOK_URL}/{account_id}"
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{AVITO_API_URL}/messenger/v3/webhook",
+            json={"url": webhook_url},
+            headers={"Authorization": f"Bearer {access_token}"}
+        )
+        if response.status_code not in (200, 201):
+            console.log(f"[red]Ошибка подписки на вебхук Avito для бота #{bot_id}: {response.status_code}, {response.text}")
+            raise HTTPException(status_code=400, detail=f"Ошибка подписки на вебхук Avito: {response.status_code}")
+        console.log(f"[green]Успешно подписан вебхук для бота #{bot_id} на URL: {webhook_url}")
+
 async def fetch_avito_items(bot_id: int, user_id: str, conn) -> list:
-    print("go fetch_avito_items")
+    console.log("[yellow]go fetch_avito_items")
     access_token = await get_valid_token(bot_id, conn)
     async with httpx.AsyncClient() as client:
         response = await client.get(
-            f"{AVITO_API_URL_ITEMS}",
+            f"{AVITO_API_URL_ITEMS}?per_page=50",
             headers={"Authorization": f"Bearer {access_token}"}
         )
-        print(response)
+        console.log(f"[yellow]Avito API response: {response.status_code}, {response.text}")
         if response.status_code != 200:
-            raise HTTPException(status_code=400, detail="Ошибка получения объявлений Avito")
-         
-        return response.json().get("resources", [])
+            raise HTTPException(status_code=400, detail=f"Ошибка получения объявлений Avito: {response.status_code}, {response.text}")
+        items = response.json().get("resources", [])
+        console.log(f"[green]Fetched {len(items)} items for bot #{bot_id}")
+        return items
 
 async def process_avito_message(bot_id: int, message: dict, conn, user: dict):
     bot = await conn.fetchrow("SELECT * FROM bots WHERE id = $1 AND user_id = $2", bot_id, user["id"])
@@ -76,7 +112,7 @@ async def process_avito_message(bot_id: int, message: dict, conn, user: dict):
         raise HTTPException(status_code=404, detail="Бот не найден")
     
     previous_messages = await conn.fetch(
-        "SELECT text, response FROM messages WHERE bot_id = $1 AND is_test = FALSE ORDER BY timestamp ASC",
+        "SELECT text, response FROM messages WHERE bot_id = $1 AND is_test = FALSE ORDER BY TIMESTAMP ASC",
         bot_id
     )
     
@@ -108,10 +144,10 @@ async def process_avito_message(bot_id: int, message: dict, conn, user: dict):
     
     await conn.execute(
         """
-        INSERT INTO messages (bot_id, text, response, status, is_test, timestamp)
-        VALUES ($1, $2, $3, $4, FALSE, NOW())
+        INSERT INTO messages (bot_id, text, response, status, is_test, TIMESTAMP, account_id)
+        VALUES ($1, $2, $3, $4, FALSE, NOW(), $5)
         """,
-        bot_id, message["text"], json.dumps(response, ensure_ascii=False), response.get("status", "Обработано")
+        bot_id, message["text"], json.dumps(response, ensure_ascii=False), response.get("status", "Обработано"), message.get("user_id")
     )
     
     return response
