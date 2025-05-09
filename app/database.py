@@ -5,7 +5,7 @@ _pool = None
 
 async def init_pool():
     global _pool
-    print("Connecting with DB_CONFIG:", DB_CONFIG)
+     
     try:
         _pool = await asyncpg.create_pool(**DB_CONFIG)
         print("Database pool initialized successfully")

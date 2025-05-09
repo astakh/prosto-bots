@@ -5,24 +5,28 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.exception_handlers import http_exception_handler
 from .auth import get_current_user_from_cookie, get_current_user_from_token, login_for_access_token
 from .database import init_pool, close_pool, get_db_connection
-from .routes import bots, logs, oauth, test_mode
+from .routes.bots_index import router as bots_index_router
+from .routes.bots_create import router as bots_create_router
+from .routes.bots_edit import router as bots_edit_router
+from .routes.bots_update import router as bots_update_router
+from .routes.bots_activate import router as bots_activate_router
+from .routes.bots_stop import router as bots_stop_router
+from .routes.bots_delete import router as bots_delete_router
+from .routes.bots_edit_items import router as bots_edit_items_router
+from .routes.bots_order_prompt import router as bots_order_prompt_router
+from .routes.balance import router as balance_router
+from .routes import logs, oauth, test_mode
 from .config import COOKIE_NAME, SERVICE_CONFIG, TELEGRAM_BOT_NAME
+from .utils import send_notification
 import asyncio
 import datetime as dt
 from rich.console import Console
-from .templates_config import templates  # Импортируем templates
-
+from .templates_config import templates
 
 console = Console()
 
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
-
-async def send_notification(telegram_id: str, text: str, conn):
-    await conn.execute(
-        "INSERT INTO notifications (telegram_id, text, status, created_at) VALUES ($1, $2, 'pending', NOW())",
-        telegram_id, text
-    )
 
 @app.exception_handler(HTTPException)
 async def custom_http_exception_handler(request: Request, exc: HTTPException):
@@ -42,9 +46,9 @@ async def shutdown_event():
     await close_pool()
 
 async def charge_balance():
-    from .database import _pool  # Импортируем пул напрямую
+    from .database import _pool
     while True:
-        async with _pool.acquire() as conn:  # Используем пул напрямую
+        async with _pool.acquire() as conn:
             users = await conn.fetch("SELECT * FROM users")
             for user in users:
                 bots = await conn.fetch("SELECT * FROM bots WHERE user_id = $1 AND status = 'active'", user["id"])
@@ -63,7 +67,7 @@ async def charge_balance():
                 else:
                     await conn.execute("UPDATE users SET balance = balance - $1 WHERE id = $2", total_cost, user["id"])
         
-        await asyncio.sleep(86400)  # Каждые 24 часа
+        await asyncio.sleep(86400)
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request, conn=Depends(get_db_connection)):
@@ -100,7 +104,16 @@ async def logout():
     response.delete_cookie(COOKIE_NAME)
     return response
 
-app.include_router(bots.router, prefix="/bots")
+app.include_router(bots_index_router, prefix="/bots")
+app.include_router(bots_create_router, prefix="/bots")
+app.include_router(bots_edit_router, prefix="/bots")
+app.include_router(bots_update_router, prefix="/bots")
+app.include_router(bots_activate_router, prefix="/bots")
+app.include_router(bots_stop_router, prefix="/bots")
+app.include_router(bots_delete_router, prefix="/bots")
+app.include_router(bots_edit_items_router, prefix="/bots")
+app.include_router(bots_order_prompt_router, prefix="/bots")
+app.include_router(balance_router)
 app.include_router(logs.router, prefix="/logs")
 app.include_router(oauth.router, prefix="/oauth")
 app.include_router(test_mode.router, prefix="/test")
